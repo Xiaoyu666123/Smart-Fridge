@@ -19,6 +19,16 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 def on_startup():
     Base.metadata.create_all(bind=engine)
     _seed_admin()
+    _seed_thresholds()
+
+
+def _seed_thresholds():
+    db = SessionLocal()
+    try:
+        from crud import seed_default_thresholds
+        seed_default_thresholds(db)
+    finally:
+        db.close()
 
 
 def _seed_admin():

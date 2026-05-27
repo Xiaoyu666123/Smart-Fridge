@@ -13,8 +13,18 @@ from schemas import (
     PreferenceResponse, PreferenceAddRequest, TraceSummaryResponse, TraceDetailResponse,
     EnvironmentResponse, LogEntryResponse,
     RegisterRequest, LoginRequest, TokenResponse, UserResponse,
+    NotificationResponse, NotificationCountResponse,
+    CategoryThresholdResponse, CategoryThresholdUpdateRequest,
 )
-from crud import handle_item_event, get_inventory_list, get_inventory_by_id, get_event_logs, get_preferences_list, add_preference, delete_preference, get_trace_list, get_trace_detail, get_unified_logs, get_conversations, create_user, get_user_by_username
+from crud import (
+    handle_item_event, get_inventory_list, get_inventory_by_id, get_event_logs,
+    get_preferences_list, add_preference, delete_preference, get_trace_list,
+    get_trace_detail, get_unified_logs, get_conversations, create_user,
+    get_user_by_username, save_log,
+    generate_expiry_notifications, get_user_notifications, get_unread_count,
+    mark_notification_read, mark_all_read,
+    get_all_thresholds, update_threshold, seed_default_thresholds,
+)
 from models import Inventory, EventLog, User
 from agents import FridgeAgent
 from services.auth import hash_password, verify_password, create_token, get_current_user, require_admin
@@ -188,12 +198,50 @@ def create_inventory(req: InventoryCreateRequest, db: Session = Depends(get_db),
     else:
         logger.info("[Dedup] 无图片，跳过去重")
 
+    # 低置信度时调用视觉模型辅助识别，云端结果优先
+    category = req.category
+    confidence = req.agent_metadata.get("confidence") if req.agent_metadata else None
+    CONFIDENCE_THRESHOLD = 0.6
+    if confidence is not None and float(confidence) < CONFIDENCE_THRESHOLD and req.snapshot_path:
+        logger.info(f"[Vision] 置信度 {confidence} 低于阈值 {CONFIDENCE_THRESHOLD}，调用视觉辅助识别 | category={req.category}")
+        try:
+            import base64
+            from services.vision import recognize_food
+            # recognize_food 需要 base64 图片数据，snapshot_path 是文件路径
+            image_path = req.snapshot_path.replace('\\', '/')
+            with open(image_path, "rb") as f:
+                image_b64 = base64.b64encode(f.read()).decode()
+            vision_result = recognize_food(image_b64)
+            original = req.category
+            vision_category = vision_result["category"]
+            # 写入系统日志
+            save_log(db, "vision_recognize", "VISION_ASSIST",
+                      "SUCCESS" if vision_category != "unknown" else "FAILED",
+                      {"original_category": original, "original_confidence": float(confidence),
+                       "vision_category": vision_category, "vision_confidence": vision_result.get("confidence", 0)})
+            if vision_category and vision_category != "unknown":
+                category = vision_category
+                logger.info(f"[Vision] 采用云端视觉识别结果 | original={original}({confidence}) -> vision={category}({vision_result['confidence']:.2f})")
+            else:
+                logger.warning(f"[Vision] 云端识别返回 unknown，保留原始分类 | original={original}")
+        except Exception as e:
+            logger.error(f"[Vision] 辅助识别异常，保留原始分类 | error={e}")
+            try:
+                save_log(db, "vision_recognize", "VISION_ASSIST", "FAILED", {"error": str(e), "original_category": req.category})
+            except Exception:
+                pass
+    else:
+        if confidence is not None and float(confidence) >= CONFIDENCE_THRESHOLD:
+            logger.info(f"[Vision] 置信度 {confidence} 高于阈值 {CONFIDENCE_THRESHOLD}，跳过视觉识别")
+        else:
+            logger.info("[Vision] 无置信度或无图片，跳过视觉识别")
+
     try:
         metadata = dict(req.agent_metadata) if req.agent_metadata else {}
 
         item = Inventory(
             device_id=req.device_id,
-            category=req.category,
+            category=category,
             status=req.status,
             remain_ratio=req.remain_ratio,
             bbox=req.bbox,
@@ -453,3 +501,72 @@ def get_trace_detail_api(trace_id: uuid.UUID, db: Session = Depends(get_db),
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询追踪详情失败: {str(e)}")
+
+
+# ---- Notification 路由 ----
+
+@router.get("/notifications", response_model=list[NotificationResponse])
+def list_notifications(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        generate_expiry_notifications(db, user.id)
+        notifications = get_user_notifications(db, user.id)
+        return notifications
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询通知失败: {str(e)}")
+
+
+@router.get("/notifications/count", response_model=NotificationCountResponse)
+def notification_count(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        generate_expiry_notifications(db, user.id)
+        count = get_unread_count(db, user.id)
+        return NotificationCountResponse(unread_count=count)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询通知数量失败: {str(e)}")
+
+
+@router.put("/notifications/{notification_id}/read")
+def read_notification(notification_id: uuid.UUID, db: Session = Depends(get_db),
+                     user: User = Depends(get_current_user)):
+    try:
+        success = mark_notification_read(db, notification_id, user.id)
+        if not success:
+            raise HTTPException(status_code=404, detail="通知不存在")
+        return {"detail": "已标记已读"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"标记已读失败: {str(e)}")
+
+
+@router.put("/notifications/read-all")
+def read_all_notifications(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        count = mark_all_read(db, user.id)
+        return {"detail": f"已标记 {count} 条通知为已读"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"全部标记已读失败: {str(e)}")
+
+
+# ---- CategoryThreshold 路由 ----
+
+@router.get("/category-thresholds", response_model=list[CategoryThresholdResponse])
+def list_thresholds(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        return get_all_thresholds(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询阈值失败: {str(e)}")
+
+
+@router.put("/category-thresholds/{threshold_id}", response_model=CategoryThresholdResponse)
+def update_threshold_api(threshold_id: uuid.UUID, req: CategoryThresholdUpdateRequest,
+                        db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        threshold = update_threshold(db, threshold_id, req.days_before_expiry)
+        if not threshold:
+            raise HTTPException(status_code=404, detail="阈值记录不存在")
+        return threshold
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新阈值失败: {str(e)}")
