@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import NotificationBell from './NotificationBell.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -80,6 +81,9 @@ function handleLogout() {
             <Expand v-else />
           </el-icon>
           <span class="page-title">{{ pageTitle }}</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 16px">
+          <NotificationBell />
         </div>
       </el-header>
 
