@@ -248,6 +248,24 @@ def get_trace_list(db: Session, agent_type: Optional[str] = None,
     return subq.all()
 
 
+def save_log(db: Session, source: str, event_type: str, status: str, detail: dict = None):
+    """写入系统日志到 agent_traces 表（作为通用日志记录）。"""
+    trace_id = uuid.uuid4()
+    log = AgentTrace(
+        trace_id=trace_id,
+        agent_type=event_type,
+        step_order=1,
+        tool_name=source,
+        tool_input=None,
+        tool_output=detail,
+        status=status,
+        duration_ms=None,
+        device_id=None,
+    )
+    db.add(log)
+    db.flush()
+
+
 def get_unified_logs(db: Session, source: Optional[str] = None,
                      event_type: Optional[str] = None,
                      status: Optional[str] = None,
@@ -318,3 +336,168 @@ def get_trace_detail(db: Session, trace_id: uuid.UUID):
         "device_id": rows[0].device_id,
         "steps": rows,
     }
+
+
+# ---- Notification CRUD ----
+
+def generate_expiry_notifications(db: Session, user_id: uuid.UUID) -> list:
+    """为指定用户生成临期食物通知。扫描库存中临期和已过期的食物，为用户创建通知记录。"""
+    from datetime import datetime, timedelta
+    from models import Notification, CategoryThreshold
+
+    now = datetime.now()
+
+    # 获取所有类别的临期阈值
+    thresholds = db.query(CategoryThreshold).all()
+    threshold_map = {t.category: t.days_before_expiry for t in thresholds}
+    default_threshold = threshold_map.get("other", 5)
+
+    # 查询所有在库且有 expire_at 的食材
+    items = (
+        db.query(Inventory)
+        .filter(Inventory.status == "IN_STOCK")
+        .all()
+    )
+
+    new_notifications = []
+    for item in items:
+        metadata = item.agent_metadata or {}
+        expire_at_str = metadata.get("expire_at")
+        if not expire_at_str:
+            continue
+
+        try:
+            expire_at = datetime.fromisoformat(expire_at_str)
+        except (ValueError, TypeError):
+            continue
+
+        days_remaining = (expire_at - now).days
+        threshold = threshold_map.get(item.category, default_threshold)
+
+        if days_remaining <= threshold:
+            # 检查是否已存在该用户对该食材的通知
+            existing = (
+                db.query(Notification)
+                .filter(
+                    Notification.user_id == user_id,
+                    Notification.related_item_id == item.id,
+                )
+                .first()
+            )
+            if existing:
+                continue
+
+            if days_remaining < 0:
+                title = f"{item.category} 已过期"
+                content = f"该食材已过期 {-days_remaining} 天，请及时处理"
+            elif days_remaining == 0:
+                title = f"{item.category} 今天过期"
+                content = f"该食材今天过期，请尽快使用"
+            else:
+                title = f"{item.category} 即将过期"
+                content = f"该食材还有 {days_remaining} 天过期"
+
+            notification = Notification(
+                user_id=user_id,
+                type="expiry_warning",
+                title=title,
+                content=content,
+                related_item_id=item.id,
+            )
+            db.add(notification)
+            new_notifications.append(notification)
+
+    if new_notifications:
+        db.commit()
+        for n in new_notifications:
+            db.refresh(n)
+
+    return new_notifications
+
+
+def get_user_notifications(db: Session, user_id: uuid.UUID) -> list:
+    """获取用户的所有通知，按创建时间降序排列。"""
+    from models import Notification
+    return (
+        db.query(Notification)
+        .filter(Notification.user_id == user_id)
+        .order_by(Notification.created_at.desc())
+        .all()
+    )
+
+
+def get_unread_count(db: Session, user_id: uuid.UUID) -> int:
+    """获取用户未读通知数量。"""
+    from models import Notification
+    return (
+        db.query(Notification)
+        .filter(Notification.user_id == user_id, Notification.is_read == False)
+        .count()
+    )
+
+
+def mark_notification_read(db: Session, notification_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    """标记单条通知为已读。"""
+    from models import Notification
+    notification = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id, Notification.user_id == user_id)
+        .first()
+    )
+    if not notification:
+        return False
+    notification.is_read = True
+    db.commit()
+    return True
+
+
+def mark_all_read(db: Session, user_id: uuid.UUID) -> int:
+    """标记用户所有未读通知为已读，返回更新数量。"""
+    from models import Notification
+    count = (
+        db.query(Notification)
+        .filter(Notification.user_id == user_id, Notification.is_read == False)
+        .update({"is_read": True})
+    )
+    db.commit()
+    return count
+
+
+# ---- CategoryThreshold CRUD ----
+
+def get_all_thresholds(db: Session) -> list:
+    """获取所有类别的临期阈值。"""
+    from models import CategoryThreshold
+    return db.query(CategoryThreshold).order_by(CategoryThreshold.category).all()
+
+
+def update_threshold(db: Session, threshold_id: uuid.UUID, days_before_expiry: int):
+    """更新指定类别的临期阈值。"""
+    from models import CategoryThreshold
+    threshold = db.query(CategoryThreshold).filter(CategoryThreshold.id == threshold_id).first()
+    if not threshold:
+        return None
+    threshold.days_before_expiry = days_before_expiry
+    db.commit()
+    db.refresh(threshold)
+    return threshold
+
+
+def seed_default_thresholds(db: Session):
+    """初始化默认的类别临期阈值（如表为空）。"""
+    from models import CategoryThreshold
+    existing = db.query(CategoryThreshold).count()
+    if existing > 0:
+        return
+    defaults = [
+        ("vegetables", 3),
+        ("fruit", 3),
+        ("meat", 2),
+        ("seafood", 2),
+        ("dairy", 3),
+        ("grains", 7),
+        ("other", 5),
+    ]
+    for category, days in defaults:
+        db.add(CategoryThreshold(category=category, days_before_expiry=days))
+    db.commit()
