@@ -205,3 +205,37 @@ class UserResponse(BaseModel):
     username: str
     role: str
     created_at: Optional[datetime] = None
+
+
+# ---- Notification 相关 Schema ----
+
+class NotificationResponse(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    type: str
+    title: str
+    content: str
+    related_item_id: Optional[uuid.UUID] = None
+    is_read: bool
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationCountResponse(BaseModel):
+    unread_count: int
+
+
+class CategoryThresholdResponse(BaseModel):
+    id: uuid.UUID
+    category: str
+    days_before_expiry: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CategoryThresholdUpdateRequest(BaseModel):
+    days_before_expiry: int = Field(..., ge=1, le=365)
