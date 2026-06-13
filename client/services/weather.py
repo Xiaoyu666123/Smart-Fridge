@@ -40,51 +40,59 @@ def _get_season() -> str:
 
 
 def get_current_weather(city: str) -> dict:
-    resp = httpx.get(
-        f"{WTTR_URL}/{city}",
-        params={"format": "j1"},
-        headers={"Accept": "application/json"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    """获取天气信息，自动重试最多 3 次。"""
+    last_err = None
+    for _ in range(3):
+        try:
+            resp = httpx.get(
+                f"{WTTR_URL}/{city}",
+                params={"format": "j1"},
+                headers={"Accept": "application/json"},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-    cc = data["current_condition"][0]
-    area = data.get("nearest_area", [{}])[0]
-    weather = data.get("weather", [{}])[0]
-    astro = weather.get("astronomy", [{}])[0] if weather else {}
+            cc = data["current_condition"][0]
+            area = data.get("nearest_area", [{}])[0]
+            weather = data.get("weather", [{}])[0]
+            astro = weather.get("astronomy", [{}])[0] if weather else {}
 
-    city_name = area.get("areaName", [{}])[0].get("value", city)
-    region = area.get("region", [{}])[0].get("value", "")
-    weather_code = cc.get("weatherCode", "113")
-    temp = float(cc["temp_C"])
-    humidity = float(cc["humidity"])
-    feels_like = float(cc["FeelsLikeC"])
-    wind_speed = float(cc["windspeedKmph"])
-    wind_dir = cc.get("winddir16Point", "")
-    cloudcover = float(cc.get("cloudcover", 0))
-    visibility = float(cc.get("visibility", 0))
-    pressure = float(cc.get("pressure", 0))
-    precip = float(cc.get("precipMM", 0))
-    uv_index = float(cc.get("uvIndex", 0))
+            city_name = area.get("areaName", [{}])[0].get("value", city)
+            region = area.get("region", [{}])[0].get("value", "")
+            weather_code = cc.get("weatherCode", "113")
+            temp = float(cc["temp_C"])
+            humidity = float(cc["humidity"])
+            feels_like = float(cc["FeelsLikeC"])
+            wind_speed = float(cc["windspeedKmph"])
+            wind_dir = cc.get("winddir16Point", "")
+            cloudcover = float(cc.get("cloudcover", 0))
+            visibility = float(cc.get("visibility", 0))
+            pressure = float(cc.get("pressure", 0))
+            precip = float(cc.get("precipMM", 0))
+            uv_index = float(cc.get("uvIndex", 0))
 
-    return {
-        "city": city_name,
-        "region": region,
-        "temperature": temp,
-        "feels_like": feels_like,
-        "humidity": humidity,
-        "wind_speed": wind_speed,
-        "wind_dir": wind_dir,
-        "weather_code": weather_code,
-        "weather_desc": _map_weather(weather_code),
-        "cloudcover": cloudcover,
-        "visibility": visibility,
-        "pressure": pressure,
-        "precip": precip,
-        "uv_index": uv_index,
-        "season": _get_season(),
-        "sunrise": astro.get("sunrise", ""),
-        "sunset": astro.get("sunset", ""),
-        "updated_at": datetime.now().isoformat(),
-    }
+            return {
+                "city": city_name,
+                "region": region,
+                "temperature": temp,
+                "feels_like": feels_like,
+                "humidity": humidity,
+                "wind_speed": wind_speed,
+                "wind_dir": wind_dir,
+                "weather_code": weather_code,
+                "weather_desc": _map_weather(weather_code),
+                "cloudcover": cloudcover,
+                "visibility": visibility,
+                "pressure": pressure,
+                "precip": precip,
+                "uv_index": uv_index,
+                "season": _get_season(),
+                "sunrise": astro.get("sunrise", ""),
+                "sunset": astro.get("sunset", ""),
+                "updated_at": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err

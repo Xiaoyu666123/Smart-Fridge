@@ -8,6 +8,7 @@ import dashscope
 from dashscope import MultiModalEmbedding
 
 from config import settings
+from services.upload_security import resolve_upload_path
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +29,26 @@ def extract_image_vector(image_source: str) -> Optional[list[float]]:
 
     # 判断是 base64 还是文件路径
     if len(image_source) > 200 and '/' not in image_source[:10]:
+        if len(image_source) > settings.MAX_BASE64_IMAGE_CHARS:
+            logger.warning("[Embedding] base64 超过大小限制，跳过向量提取")
+            return None
         # 大概率是 base64 数据
         image_url = f"data:image/jpeg;base64,{image_source}"
         logger.info(f"[Embedding] 识别为 base64 数据 | len={len(image_source)}")
     else:
         # 文件路径
-        filepath = image_source.replace('\\', '/')
+        filepath = resolve_upload_path(image_source)
+        if not filepath:
+            logger.warning("[Embedding] 拒绝读取 uploads 目录之外的路径")
+            return None
         logger.info(f"[Embedding] 识别为文件路径 | raw={image_source} | normalized={filepath}")
         try:
             with open(filepath, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
+                raw = f.read(settings.MAX_IMAGE_BYTES + 1)
+            if len(raw) > settings.MAX_IMAGE_BYTES:
+                logger.warning(f"[Embedding] 文件超过大小限制 | path={filepath}")
+                return None
+            b64 = base64.b64encode(raw).decode()
             image_url = f"data:image/jpeg;base64,{b64}"
             logger.info(f"[Embedding] 文件读取成功 | base64_len={len(b64)}")
         except Exception as e:
@@ -45,6 +56,10 @@ def extract_image_vector(image_source: str) -> Optional[list[float]]:
             return None
 
     logger.info(f"[Embedding] 发起向量提取 | image_len={len(image_url)}")
+    from services.usage import track_usage as _track
+    import time as _time
+    t0 = _time.time()
+    status = "SUCCESS"
     try:
         result = MultiModalEmbedding.call(
             model="multimodal-embedding-v1",
@@ -57,8 +72,22 @@ def extract_image_vector(image_source: str) -> Optional[list[float]]:
             logger.info(f"[Embedding] 向量提取成功 | dim={len(embedding)}")
             return embedding
         else:
+            status = "FAILED"
             logger.error(f"[Embedding] 向量提取失败 | code={result.code} | msg={result.message}")
             return None
     except Exception as e:
+        status = "FAILED"
         logger.error(f"[Embedding] 向量提取异常 | error={e}")
         return None
+    finally:
+        # multimodal-embedding 不返回 token 数；按"1 次调用"占位（用 1 token 表示发生过）
+        # PRICING 表里这个模型也是按调用次数估算
+        _track(
+            provider="embedding",
+            model="multimodal-embedding-v1",
+            endpoint="image_vector",
+            prompt_tokens=1,
+            completion_tokens=0,
+            duration_ms=int((_time.time() - t0) * 1000),
+            status=status,
+        )

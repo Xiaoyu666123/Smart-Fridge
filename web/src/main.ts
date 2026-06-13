@@ -14,6 +14,11 @@ app.use(createPinia())
 app.use(router)
 app.use(ElementPlus)
 
+// 初始化主题（在 mount 之前应用 data-theme，避免闪烁）
+import { useThemeStore } from './stores/theme'
+const themeStore = useThemeStore()
+void themeStore.isDark  // 触发 watch immediate
+
 for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component)
 }

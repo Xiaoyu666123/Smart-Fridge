@@ -15,6 +15,7 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        ws: true,   // 让 /api 下的 ws 升级请求也代理到后端
       },
       '/uploads': {
         target: 'http://localhost:8000',

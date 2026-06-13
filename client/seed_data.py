@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import SessionLocal, engine, Base
-from models import Inventory, User
+from models import Inventory, Admin, User
 from services.auth import hash_password
 
 
@@ -48,7 +48,7 @@ def create_placeholder_image(filename: str, r: int, g: int, b: int, size: int = 
 
 SEED_DATA = [
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "西红柿",
         "status": "IN_STOCK",
         "remain_ratio": 0.85,
@@ -60,7 +60,7 @@ SEED_DATA = [
         "color": (220, 50, 50),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "鸡蛋",
         "status": "IN_STOCK",
         "remain_ratio": 0.70,
@@ -72,7 +72,7 @@ SEED_DATA = [
         "color": (255, 240, 200),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "牛奶",
         "status": "IN_STOCK",
         "remain_ratio": 0.60,
@@ -84,7 +84,7 @@ SEED_DATA = [
         "color": (240, 248, 255),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "黄瓜",
         "status": "IN_STOCK",
         "remain_ratio": 0.90,
@@ -96,7 +96,7 @@ SEED_DATA = [
         "color": (50, 180, 50),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "猪肉",
         "status": "IN_STOCK",
         "remain_ratio": 0.50,
@@ -108,7 +108,7 @@ SEED_DATA = [
         "color": (255, 180, 180),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "苹果",
         "status": "IN_STOCK",
         "remain_ratio": 0.95,
@@ -120,7 +120,7 @@ SEED_DATA = [
         "color": (220, 50, 50),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "酸奶",
         "status": "IN_STOCK",
         "remain_ratio": 0.40,
@@ -132,7 +132,7 @@ SEED_DATA = [
         "color": (255, 255, 200),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "豆腐",
         "status": "OUT_PENDING",
         "remain_ratio": 0.30,
@@ -144,7 +144,7 @@ SEED_DATA = [
         "color": (255, 255, 240),
     },
     {
-        "device_id": "fridge-001",
+        "device_id": "luckfox",
         "category": "白菜",
         "status": "CONSUMED",
         "remain_ratio": 0.00,
@@ -156,7 +156,7 @@ SEED_DATA = [
         "color": (180, 220, 180),
     },
     {
-        "device_id": "fridge-002",
+        "device_id": "luckfox",
         "category": "三文鱼",
         "status": "IN_STOCK",
         "remain_ratio": 0.80,
@@ -177,22 +177,22 @@ def seed():
     db = SessionLocal()
     try:
         # 检查是否已有种子数据
-        existing = db.query(Inventory).filter(Inventory.device_id == "fridge-001").first()
+        existing = db.query(Inventory).filter(Inventory.device_id == "luckfox").first()
         if existing:
             print("种子数据已存在，跳过插入。如需重新插入，请先清空 inventory 表。")
             return
 
-        # 确保 admin 用户存在
-        admin = db.query(User).filter(User.username == "admin").first()
+        # 确保 admin 用户存在（admins 表）
+        admin = db.query(Admin).filter(Admin.username == "admin").first()
         if not admin:
-            admin = User(username="admin", password_hash=hash_password("admin123"), role="admin")
+            admin = Admin(username="admin", password_hash=hash_password("admin123"), real_name="系统管理员")
             db.add(admin)
             db.flush()
 
         # 创建测试普通用户
         test_user = db.query(User).filter(User.username == "testuser").first()
         if not test_user:
-            test_user = User(username="testuser", password_hash=hash_password("test123"), role="user")
+            test_user = User(username="testuser", password_hash=hash_password("test123"))
             db.add(test_user)
             db.flush()
             print("创建测试用户: testuser / test123")

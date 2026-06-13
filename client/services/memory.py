@@ -27,7 +27,7 @@ def extract_preferences(user_message: str) -> list[dict]:
     """
     logger.info(f"[LLM] 偏好提取 | message={user_message[:80]}")
     try:
-        content = _call_llm(EXTRACT_PROMPT.format(message=user_message))
+        content = _call_llm(EXTRACT_PROMPT.format(message=user_message), endpoint="preference_extract")
         result = json.loads(content.strip().strip("```json").strip("```").strip())
         if isinstance(result, list):
             logger.info(f"[LLM] 偏好提取完成 | count={len(result)} | prefs={result}")

@@ -1,20 +1,97 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElNotification } from 'element-plus'
 import {
   getNotifications,
   getNotificationCount,
   markAsRead,
   markAllAsRead,
   type NotificationItem,
-} from '@/api/notification'
+} from '@/api/user/notification'
+import { wsUrl } from '@/config/env'
 
 const router = useRouter()
 const unreadCount = ref(0)
 const notifications = ref<NotificationItem[]>([])
 const loading = ref(false)
 const popoverVisible = ref(false)
+
+// ---- WebSocket 实时推送 ----
+let ws: WebSocket | null = null
+let pingTimer: ReturnType<typeof setInterval> | null = null
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+const wsConnected = ref(false)
+
+function connectWS() {
+  const token = localStorage.getItem('user_token') || ''
+  if (!token) return
+  const url = wsUrl(`/user/ws/notifications?token=${encodeURIComponent(token)}`)
+  try {
+    ws = new WebSocket(url)
+  } catch (e) {
+    console.warn('[ws] create failed', e)
+    scheduleReconnect()
+    return
+  }
+  ws.onopen = () => {
+    wsConnected.value = true
+    console.log('[ws] connected')
+    // 心跳：30s 发一次 ping
+    if (pingTimer) clearInterval(pingTimer)
+    pingTimer = setInterval(() => {
+      try { ws?.send('ping') } catch {}
+    }, 30000)
+  }
+  ws.onmessage = (evt) => {
+    if (evt.data === 'pong') return
+    try {
+      const ev = JSON.parse(evt.data)
+      if (ev.type === 'notification.new' && ev.data) {
+        // 即时通知：弹一条 toast + 计数 +1
+        unreadCount.value = unreadCount.value + 1
+        ElNotification({
+          title: ev.data.title || '新通知',
+          message: ev.data.content || '',
+          type: 'warning',
+          duration: 5000,
+          position: 'top-right',
+        })
+        // 把新通知插到最前面（如果列表已经加载过）
+        if (notifications.value.length > 0) {
+          notifications.value.unshift(ev.data as NotificationItem)
+        }
+      } else if (ev.type === 'notification.count') {
+        unreadCount.value = ev.unread_count || 0
+      }
+    } catch (e) {
+      console.warn('[ws] parse failed', evt.data)
+    }
+  }
+  ws.onerror = (e) => {
+    console.warn('[ws] error', e)
+  }
+  ws.onclose = () => {
+    wsConnected.value = false
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
+    scheduleReconnect()
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    connectWS()
+  }, 5000)
+}
+
+function closeWS() {
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  try { ws?.close() } catch {}
+  ws = null
+}
 
 async function fetchCount() {
   try {
@@ -63,7 +140,7 @@ function handleItemClick(item: NotificationItem) {
   }
   if (item.related_item_id) {
     popoverVisible.value = false
-    router.push('/')
+    router.push('/user/inventory')
   }
 }
 
@@ -73,6 +150,11 @@ function handlePopoverShow() {
 
 onMounted(() => {
   fetchCount()
+  connectWS()
+})
+
+onBeforeUnmount(() => {
+  closeWS()
 })
 
 defineExpose({ fetchCount })
