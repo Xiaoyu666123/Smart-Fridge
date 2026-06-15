@@ -3,16 +3,19 @@
 仅持有 admin token 的会话可访问，所有路由统一通过 get_current_admin 依赖鉴权。
 """
 
+import json
 import os
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, WebSocket, WebSocketDisconnect, Query, Request
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Admin, Inventory
+from models import Admin, Inventory, DeviceRawEvent, AgentTrace
 from schemas import (
     LoginRequest, AdminTokenResponse, AdminInfoResponse,
     ItemEventRequest, InventoryResponse, InventoryCreateRequest, InventoryUpdateRequest,
@@ -26,6 +29,7 @@ from schemas import (
     LabelScanRequest, LabelScanResponse, PendingLabelItem,
     VisionAssistConfigResponse, VisionAssistConfigUpdateRequest,
     DeviceItem, DeviceUpdateRequest, HeartbeatRequest, HeartbeatResponse,
+    DeviceRawEventResponse,
 )
 from crud import (
     handle_item_event, get_inventory_list, get_inventory_by_id, get_event_logs,
@@ -59,6 +63,227 @@ router = APIRouter(prefix="/admin")
 UPLOAD_DIR = "uploads"
 
 
+def _compact_device_payload(value):
+    """保留端侧 JSON 结构，但不把 base64 图片长期塞进数据库。"""
+    image_fields = {"crop_image", "label_image"}
+
+    def walk(v, key=None):
+        if isinstance(v, dict):
+            if v.get("_base64_omitted") is True:
+                return v
+            return {k: walk(val, k) for k, val in v.items()}
+        if isinstance(v, list):
+            return [walk(x, key) for x in v]
+        if key in image_fields and isinstance(v, str):
+            return {
+                "_base64_omitted": True,
+                "present": bool(v),
+                "chars": len(v),
+            }
+        return v
+
+    return walk(value)
+
+
+def _payload_for_replay(value):
+    """把存档 payload 里的图片摘要转成 None，便于无图重处理。"""
+    if isinstance(value, dict):
+        if value.get("_base64_omitted") is True:
+            return None
+        return {k: _payload_for_replay(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_payload_for_replay(x) for x in value]
+    return value
+
+
+def _map_device_event_type(value):
+    if not isinstance(value, str):
+        return value
+    key = value.strip()
+    mapping = {
+        "入库": "ITEM_IN",
+        "放入": "ITEM_IN",
+        "in": "ITEM_IN",
+        "item_in": "ITEM_IN",
+        "ITEM_IN": "ITEM_IN",
+        "出库": "ITEM_OUT",
+        "取出": "ITEM_OUT",
+        "out": "ITEM_OUT",
+        "item_out": "ITEM_OUT",
+        "ITEM_OUT": "ITEM_OUT",
+        "整理": "ITEM_MOVED",
+        "移动": "ITEM_MOVED",
+        "move": "ITEM_MOVED",
+        "moved": "ITEM_MOVED",
+        "item_moved": "ITEM_MOVED",
+        "ITEM_MOVED": "ITEM_MOVED",
+        "agent_update": "AGENT_UPDATE",
+        "AGENT_UPDATE": "AGENT_UPDATE",
+    }
+    return mapping.get(key, mapping.get(key.lower(), key))
+
+
+def _first_present(source: dict, *keys):
+    for key in keys:
+        if key in source and source[key] is not None:
+            return source[key]
+    return None
+
+
+def _normalize_device_payload(payload: dict) -> dict:
+    """兼容端侧联调期常见字段名差异，归一成 ItemEventRequest。"""
+    normalized = dict(payload)
+
+    if not normalized.get("device_id"):
+        normalized["device_id"] = _first_present(normalized, "deviceId", "device", "deviceID")
+
+    if not normalized.get("event_type"):
+        normalized["event_type"] = _first_present(normalized, "event", "type", "action", "business_type")
+    normalized["event_type"] = _map_device_event_type(normalized.get("event_type"))
+
+    if not normalized.get("timestamp"):
+        normalized["timestamp"] = int(time.time() * 1000)
+
+    if "data" not in normalized and isinstance(normalized.get("items"), list):
+        normalized["data"] = normalized["items"]
+
+    items = normalized.get("data")
+    if isinstance(items, list):
+        normalized_items = []
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                normalized_items.append(raw_item)
+                continue
+            item = dict(raw_item)
+            if "local_track_id" not in item:
+                item["local_track_id"] = _first_present(item, "track_id", "trackId", "localTrackId", "id")
+            if "category" not in item:
+                item["category"] = _first_present(item, "label", "name", "class", "class_name")
+            if "confidence" not in item:
+                item["confidence"] = _first_present(item, "conf", "score")
+            if "bbox" not in item:
+                item["bbox"] = _first_present(item, "box", "rect")
+            normalized_items.append(item)
+        normalized["data"] = normalized_items
+
+    return normalized
+
+
+def _validation_error_message(exc: ValidationError) -> str:
+    parts = []
+    for err in exc.errors()[:5]:
+        loc = ".".join(str(x) for x in err.get("loc", []))
+        msg = err.get("msg", "校验失败")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "；".join(parts) or "请求字段校验失败"
+
+
+def _latest_trace_id(db: Session, device_id: Optional[str], event_type: Optional[str]):
+    if not device_id or not event_type:
+        return None
+    row = (
+        db.query(AgentTrace.trace_id)
+        .filter(AgentTrace.device_id == device_id, AgentTrace.agent_type == event_type)
+        .order_by(AgentTrace.created_at.desc())
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _mark_raw_event(
+    db: Session,
+    event_id: uuid.UUID,
+    *,
+    status: str,
+    error_message: Optional[str] = None,
+    related_inventory_ids: Optional[list[str]] = None,
+    trace_id=None,
+):
+    db.rollback()
+    row = db.query(DeviceRawEvent).filter(DeviceRawEvent.id == event_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="端侧事件记录不存在")
+    row.status = status
+    row.error_message = error_message
+    row.related_inventory_ids = related_inventory_ids
+    row.trace_id = trace_id
+    row.processed_at = datetime.now()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def _process_item_event_request(db: Session, event: ItemEventRequest) -> list[Inventory]:
+    # 端侧事件视为设备活跃信号
+    try:
+        upsert_device_seen(
+            db,
+            event.device_id,
+            event=event.event_type or "item_event",
+            payload={"items": len(event.data) if event.data else 0},
+        )
+    except Exception:
+        pass
+
+    agent = FridgeAgent()
+    results = []
+    for item in event.data:
+        if event.event_type == "ITEM_IN":
+            inv = agent.handle_item_in(db, event, item)
+            if inv:
+                results.append(inv)
+        elif event.event_type == "ITEM_OUT":
+            inv = agent.handle_item_out(db, event, item)
+            if inv:
+                results.append(inv)
+        else:
+            results_list = handle_item_event(db, event)
+            results.extend(results_list)
+            break
+    return results
+
+
+def _process_device_raw_event(db: Session, event_id: uuid.UUID, payload: dict):
+    db.rollback()
+    row = db.query(DeviceRawEvent).filter(DeviceRawEvent.id == event_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="端侧事件记录不存在")
+    row.status = "processing"
+    row.error_message = None
+    row.related_inventory_ids = None
+    row.trace_id = None
+    db.commit()
+
+    try:
+        event = ItemEventRequest.model_validate(payload)
+    except ValidationError as exc:
+        return _mark_raw_event(
+            db,
+            event_id,
+            status="failed",
+            error_message=_validation_error_message(exc),
+        )
+
+    try:
+        results = _process_item_event_request(db, event)
+        related_ids = [str(inv.id) for inv in results]
+        trace_id = _latest_trace_id(db, event.device_id, event.event_type)
+        return _mark_raw_event(
+            db,
+            event_id,
+            status="success",
+            related_inventory_ids=related_ids,
+            trace_id=trace_id,
+        )
+    except Exception as exc:
+        return _mark_raw_event(
+            db,
+            event_id,
+            status="failed",
+            error_message=str(exc),
+        )
+
+
 # ---- Auth ----
 
 @router.post("/auth/login", response_model=AdminTokenResponse)
@@ -87,31 +312,107 @@ def admin_me(admin: Admin = Depends(get_current_admin)):
 def receive_item_event(event: ItemEventRequest, db: Session = Depends(get_db),
                        admin: Admin = Depends(get_current_admin)):
     try:
-        # 端侧事件视为设备活跃信号
-        try:
-            upsert_device_seen(db, event.device_id, event=event.event_type or "item_event",
-                                payload={"items": len(event.data) if event.data else 0})
-        except Exception:
-            pass
-        agent = FridgeAgent()
-        results = []
-        for item in event.data:
-            if event.event_type == "ITEM_IN":
-                inv = agent.handle_item_in(db, event, item)
-                if inv:
-                    results.append(inv)
-            elif event.event_type == "ITEM_OUT":
-                inv = agent.handle_item_out(db, event, item)
-                if inv:
-                    results.append(inv)
-            else:
-                results_list = handle_item_event(db, event)
-                results.extend(results_list)
-                break
-        return results
+        return _process_item_event_request(db, event)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"处理事件失败: {str(e)}")
+
+
+@router.post("/device-ingest", response_model=DeviceRawEventResponse)
+async def ingest_device_payload(request: Request, db: Session = Depends(get_db),
+                                admin: Admin = Depends(get_current_admin)):
+    """端侧联调入口：先保存上报摘要，再尝试按现有物品事件流程处理。"""
+    body = await request.body()
+    body_text = body.decode("utf-8", errors="replace")
+
+    try:
+        payload = json.loads(body_text)
+    except json.JSONDecodeError as exc:
+        row = DeviceRawEvent(
+            raw_payload={
+                "_invalid_json": True,
+                "body_preview": body_text[:2000],
+            },
+            status="failed",
+            error_message=f"JSON 解析失败: {exc.msg}",
+            processed_at=datetime.now(),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    if not isinstance(payload, dict):
+        row = DeviceRawEvent(
+            raw_payload={"value": payload},
+            status="failed",
+            error_message="请求体必须是 JSON object",
+            processed_at=datetime.now(),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    normalized = _normalize_device_payload(payload)
+    row = DeviceRawEvent(
+        device_id=normalized.get("device_id"),
+        event_type=normalized.get("event_type"),
+        raw_payload=_compact_device_payload(payload),
+        normalized_payload=_compact_device_payload(normalized),
+        status="received",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    return _process_device_raw_event(db, row.id, normalized)
+
+
+@router.get("/device-raw-events", response_model=list[DeviceRawEventResponse])
+def list_device_raw_events(
+    device_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    admin: Admin = Depends(get_current_admin),
+):
+    q = db.query(DeviceRawEvent)
+    if device_id:
+        q = q.filter(DeviceRawEvent.device_id == device_id)
+    if event_type:
+        q = q.filter(DeviceRawEvent.event_type == event_type)
+    if status:
+        q = q.filter(DeviceRawEvent.status == status)
+    return q.order_by(DeviceRawEvent.created_at.desc()).offset(offset).limit(limit).all()
+
+
+@router.get("/device-raw-events/{event_id}", response_model=DeviceRawEventResponse)
+def get_device_raw_event(event_id: uuid.UUID, db: Session = Depends(get_db),
+                         admin: Admin = Depends(get_current_admin)):
+    row = db.query(DeviceRawEvent).filter(DeviceRawEvent.id == event_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="端侧事件记录不存在")
+    return row
+
+
+@router.post("/device-raw-events/{event_id}/reprocess", response_model=DeviceRawEventResponse)
+def reprocess_device_raw_event(event_id: uuid.UUID, db: Session = Depends(get_db),
+                               admin: Admin = Depends(get_current_admin)):
+    row = db.query(DeviceRawEvent).filter(DeviceRawEvent.id == event_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="端侧事件记录不存在")
+    payload = row.normalized_payload or row.raw_payload
+    if not isinstance(payload, dict):
+        return _mark_raw_event(
+            db,
+            event_id,
+            status="failed",
+            error_message="没有可重处理的 JSON payload",
+        )
+    return _process_device_raw_event(db, event_id, _payload_for_replay(payload))
 
 
 # ---- Inventory CRUD ----

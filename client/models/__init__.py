@@ -259,6 +259,34 @@ class DeviceHeartbeat(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=True)
 
 
+class DeviceRawEvent(Base):
+    """端侧联调收件箱。
+
+    保存端侧上报的原始结构和后端规范化后的结构，方便排查字段不匹配、
+    识别失败、图片缺失等对接问题。base64 图片不长期入库，只保留摘要。
+    """
+    __tablename__ = "device_raw_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id: Mapped[str] = mapped_column(String(50), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=True)
+    raw_payload = mapped_column(JSONB, nullable=True)
+    normalized_payload = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="received")
+    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    related_inventory_ids = mapped_column(JSONB, nullable=True)
+    trace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('received', 'processing', 'success', 'failed', 'ignored')",
+            name="device_raw_events_status_check",
+        ),
+    )
+
+
 class ShoppingItem(Base):
     """用户购物清单项。
 

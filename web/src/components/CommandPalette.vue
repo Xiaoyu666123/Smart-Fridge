@@ -50,6 +50,7 @@ const adminPages: { path: string; title: string; icon: string }[] = [
   { path: '/admin/batch-recognize', title: '整柜识别', icon: 'Camera' },
   { path: '/admin/pending-labels', title: '标签缓冲', icon: 'CollectionTag' },
   { path: '/admin/devices', title: '设备管理', icon: 'Monitor' },
+  { path: '/admin/device-ingest', title: '端侧联调', icon: 'DataLine' },
   { path: '/admin/users', title: '用户管理', icon: 'User' },
   { path: '/admin/agent', title: 'Agent 配置', icon: 'Cpu' },
   { path: '/admin/vision-assist', title: '视觉辅助策略', icon: 'MagicStick' },

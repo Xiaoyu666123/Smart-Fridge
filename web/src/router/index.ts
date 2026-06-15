@@ -68,6 +68,12 @@ const router = createRouter({
           meta: { title: '设备管理', userType: 'admin' },
         },
         {
+          path: 'device-ingest',
+          name: 'AdminDeviceIngest',
+          component: () => import('@/views/admin/DeviceIngest.vue'),
+          meta: { title: '端侧联调', userType: 'admin' },
+        },
+        {
           path: 'agent',
           name: 'AdminAgentConfig',
           component: () => import('@/views/admin/AgentConfig.vue'),

@@ -569,3 +569,20 @@ class HeartbeatResponse(BaseModel):
     status: str
     last_seen_at: Optional[str] = None
     auto_registered: bool = False
+
+
+class DeviceRawEventResponse(BaseModel):
+    id: uuid.UUID
+    device_id: Optional[str] = None
+    event_type: Optional[str] = None
+    raw_payload: Optional[dict] = None
+    normalized_payload: Optional[dict] = None
+    status: str
+    error_message: Optional[str] = None
+    related_inventory_ids: Optional[list[str]] = None
+    trace_id: Optional[uuid.UUID] = None
+    created_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

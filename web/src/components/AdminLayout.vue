@@ -54,6 +54,7 @@ const menuItems = [
   { path: '/admin/batch-recognize', icon: 'Camera', title: '整柜识别' },
   { path: '/admin/pending-labels', icon: 'CollectionTag', title: '标签缓冲' },
   { path: '/admin/devices', icon: 'Monitor', title: '设备管理' },
+  { path: '/admin/device-ingest', icon: 'DataLine', title: '端侧联调' },
   { path: '/admin/users', icon: 'User', title: '用户管理' },
   { path: '/admin/agent', icon: 'Cpu', title: 'Agent 配置' },
   { path: '/admin/vision-assist', icon: 'MagicStick', title: '视觉辅助' },
